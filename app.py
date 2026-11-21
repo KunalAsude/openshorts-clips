@@ -32,6 +32,7 @@ from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 import recut
+import content_filter
 import layout_ranges
 import watermarked
 import media_auth
@@ -5986,6 +5987,35 @@ def _take_pending_upload(upload_id, user_id):
     return slot
 
 
+# A transcript sent with an upload (a previous run's, so the job skips
+# transcription). It is someone else's file: JSON only, capped, and only the
+# shape main.py's --transcript accepts; main.py transcribes normally when it
+# turns out unusable.
+MAX_TRANSCRIPT_UPLOAD_BYTES = 50 * 1024 * 1024
+
+
+async def _save_uploaded_transcript(upload, job_output_dir):
+    """Write a valid uploaded transcript to the job dir; its path, or a 400."""
+    data = bytearray()
+    while chunk := await upload.read(1024 * 1024):
+        data.extend(chunk)
+        if len(data) > MAX_TRANSCRIPT_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Transcript too large (max 50 MB)")
+    try:
+        parsed = json.loads(bytes(data).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise HTTPException(status_code=400, detail="Transcript is not valid JSON")
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("segments"), list) \
+            or not parsed["segments"]:
+        raise HTTPException(status_code=400,
+                            detail="Transcript needs a non-empty 'segments' list")
+    os.makedirs(job_output_dir, exist_ok=True)
+    path = os.path.join(job_output_dir, "source_transcript.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(parsed, f)
+    return path
+
+
 def layout_env(requested):
     """Env overrides for the layouts this job allows. Unknown names are ignored
     rather than rejected: a newer dashboard must not break an older API.
@@ -6096,6 +6126,7 @@ async def process_endpoint(
     file: Optional[UploadFile] = File(None),
     url: Optional[str] = Form(None),
     acknowledged: Optional[str] = Form(None),
+    transcript: Optional[UploadFile] = File(None),
     output_format: Optional[str] = Form(None),
     layouts: Optional[str] = Form(None),
     force_low_quality: Optional[str] = Form(None),
@@ -6113,6 +6144,11 @@ async def process_endpoint(
     source_start: Optional[str] = Form(None),
     source_end: Optional[str] = Form(None),
 ):
+    if transcript is not None and file is None:
+        # Only an uploaded file is guaranteed to be the video the transcript
+        # was made from; a link may resolve to a different cut.
+        raise HTTPException(status_code=400,
+                            detail="A transcript can only be sent with a file upload")
     api_key = await resolve_gemini(request)
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
         # Self-host with an OpenAI-compatible server configured needs no
@@ -6362,6 +6398,13 @@ async def process_endpoint(
             _reject_short_source(upload_duration)
 
         cmd.extend(["-i", input_path])
+        if transcript is not None:
+            try:
+                transcript_path = await _save_uploaded_transcript(transcript, job_output_dir)
+            except HTTPException:
+                await asyncio.to_thread(_discard_rejected_source, input_path, job_output_dir)
+                raise
+            cmd.extend(["--transcript", transcript_path])
 
     cmd.extend(["-o", job_output_dir])
     if output_format and output_format != "auto":
@@ -7496,7 +7539,8 @@ async def get_clip_transcript(job_id: str, clip_index: int, request: Request):
         for word_info in segment.get('words', []):
             if word_info['end'] > clip_start and word_info['start'] < clip_end:
                 captions.append({
-                    "text": word_info.get('word', '').strip(),
+                    # Same swear masking as the burned captions (content_filter).
+                    "text": content_filter.mask_word(word_info.get('word', '').strip()),
                     "startMs": int((max(0, word_info['start'] - clip_start)) * 1000),
                     "endMs": int((max(0, word_info['end'] - clip_start)) * 1000),
                 })

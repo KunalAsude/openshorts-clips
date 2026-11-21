@@ -108,7 +108,33 @@ def prepare(source, start, end, workdir):
     return path, offset
 
 
-def submit(api, path, layout, clips):
+def check_manifest(manifest_path, current):
+    """Stop before a transcript is laid over a different video or stretch:
+    the captions and cut points would all be off."""
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            old = json.load(f)
+    except (OSError, ValueError) as e:
+        fail(f"The earlier run's transcript has no readable manifest ({e}).")
+    problems = []
+    if str(old.get("video_url", "")).strip() != current["video_url"].strip():
+        problems.append("a different video link")
+    for key in ("start", "end"):
+        if old.get(key) != current[key]:
+            problems.append(f"a different {key} ({old.get(key)!r} vs {current[key]!r})")
+    try:
+        if abs(float(old.get("duration", -1)) - current["duration"]) > 1.0:
+            problems.append(f"a different length ({float(old['duration']):.0f}s vs "
+                            f"{current['duration']:.0f}s)")
+    except (TypeError, ValueError):
+        problems.append("no recorded length")
+    if problems:
+        fail("The transcript from that run was made for " + ", ".join(problems)
+             + ". Use the same video_url, start and end as that run, or leave "
+               "transcript_from_run empty to transcribe again.")
+
+
+def submit(api, path, layout, clips, transcript=None):
     fields = {
         "output_format": "vertical",
         "clip_min_seconds": "20",
@@ -123,6 +149,8 @@ def submit(api, path, layout, clips):
     cmd = ["curl", "-sS", "--fail-with-body", "--max-time", "3600",
            "-X", "POST", f"{api}/api/process",
            "-F", f"file=@{path};type=video/mp4"]
+    if transcript:
+        cmd += ["-F", f"transcript=@{transcript};type=application/json"]
     for k, v in fields.items():
         cmd += ["--form-string", f"{k}={v}"]
     res = subprocess.run(cmd, capture_output=True, text=True)
@@ -202,7 +230,8 @@ def collect(api, result, out, offset=0.0):
             clip["vod_start"] = round(offset + start, 2)
             clip["vod_end"] = round(offset + end, 2)
             span = f"{hms(clip['vod_start'])}-{hms(clip['vod_end'])} in the VOD"
-        lines += [f"## {i}. {title}", "",
+        warn = " ⚠ strong language" if clip.get("strong_language") else ""
+        lines += [f"## {i}. {title}{warn}", "",
                   f"- File: `{name}`" + (f" ({span})" if span else ""),
                   f"- Hook: {clip.get('viral_hook_text') or ''}",
                   f"- TikTok: {clip.get('video_description_for_tiktok') or ''}",
@@ -233,6 +262,15 @@ def main(argv=None):
     p.add_argument("--clips", default="8")
     p.add_argument("--start", default="")
     p.add_argument("--end", default="")
+    p.add_argument("--video-url", default="",
+                   help="the source link, recorded with the transcript")
+    p.add_argument("--transcript", default="",
+                   help="transcript.json from an earlier run: skips transcription")
+    p.add_argument("--transcript-manifest", default="",
+                   help="manifest.json saved with that transcript")
+    p.add_argument("--state-dir", default="",
+                   help="where to write job.json (job id + manifest) for saving the "
+                        "transcript afterwards")
     p.add_argument("--deadline-minutes", type=int, default=300,
                    help="minutes from now the job may take, unless --finish-by")
     p.add_argument("--finish-by", type=float, default=0,
@@ -253,7 +291,20 @@ def main(argv=None):
 
     stop_at = a.finish_by or (time.time() + a.deadline_minutes * 60)
     path, offset = prepare(a.source, parse_time(a.start), parse_time(a.end), a.workdir)
-    job_id = submit(a.api.rstrip("/"), path, layout, clips)
+    # Seconds, so "35:00" and "2100" count as the same start.
+    manifest = {"video_url": a.video_url, "start": parse_time(a.start), "end": parse_time(a.end),
+                "duration": round(probe(path)[0], 2)}
+    if a.transcript:
+        if not os.path.exists(a.transcript):
+            fail("transcript_from_run is set but that run has no transcript "
+                 "artifact (it may have failed before transcribing, or expired).")
+        check_manifest(a.transcript_manifest, manifest)
+        print("Reusing the earlier run's transcript: no transcription this time", flush=True)
+    job_id = submit(a.api.rstrip("/"), path, layout, clips, a.transcript or None)
+    if a.state_dir:
+        os.makedirs(a.state_dir, exist_ok=True)
+        with open(os.path.join(a.state_dir, "job.json"), "w", encoding="utf-8") as f:
+            json.dump({"job_id": job_id, "manifest": manifest}, f)
     status, result = follow(a.api.rstrip("/"), job_id, stop_at)
     if status != "completed":
         fail(f"OpenShorts job ended as '{status}' (see the log above).")

@@ -5,6 +5,7 @@ import sys
 
 from ffmpeg_utils import (video_encode_args, escape_filter_value, QUALITY,
                           METADATA_SCRUB, finished_before_crash)
+import content_filter
 import gpu_decode
 
 
@@ -175,6 +176,9 @@ def _collect_word_blocks(transcript, clip_start, clip_end, max_chars=20, max_dur
             cleaned_word = _normalize_subtitle_word(word_info.get('word', ''))
             if not cleaned_word:
                 continue
+            # Strong swearing is masked in burned captions (f***); the audio
+            # keeps it. CONTENT_FILTER=0 turns this off (content_filter).
+            cleaned_word = content_filter.mask_word(cleaned_word)
             words.append({
                 'word': cleaned_word,
                 'start': max(0, word_info['start'] - clip_start),

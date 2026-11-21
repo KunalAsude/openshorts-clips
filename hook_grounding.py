@@ -163,6 +163,8 @@ def reground(clip_path, clip, transcript, start, end) -> Optional[dict]:
             current_hook=clip.get("viral_hook_text") or "",
             current_title=clip.get("video_title_for_youtube_short") or "",
             transcript=clip_words(transcript, start, end)[:4000] or "(no speech)")
+        import content_filter
+        prompt += content_filter.prompt_rule()
         answer = _ask_gemini(frames, prompt, api_key)
         hook = str(answer.get("viral_hook_text") or "").strip()
         title = str(answer.get("video_title_for_youtube_short") or "").strip()

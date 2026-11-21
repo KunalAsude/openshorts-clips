@@ -32,9 +32,31 @@ Optional `.env` settings:
 | Variable | What it does |
 |---|---|
 | `GEMINI_API_KEY` | Your Google Gemini key |
-| `GEMINI_MODEL_CLIPS` | Model for moment picking, e.g. `gemini-3.7-flash` |
-| `GEMINI_MODEL_CLIPS_FALLBACK` | Used when that model is busy or timing out (default `gemini-3.1-flash-lite`) |
+| `GEMINI_MODEL_CLIPS` | Model for moment picking, e.g. `gemini-3.6-flash` |
+| `GEMINI_MODEL_CLIPS_FALLBACK` | Comma-separated models to try when that one is busy, in order (default `gemini-3.5-flash,gemini-3.7-flash,gemini-3.1-flash-lite`) |
 | `GEMINI_MODEL` | Model for everything else (default `gemini-3.1-flash-lite`) |
+| `CONTENT_FILTER` | `0` turns the content filter off (on by default) |
+| `CONTENT_FILTER_EXTRA` | Your own comma-separated words, treated like slurs |
+
+When a model is busy (503 "high demand", 429, 500 or a timeout), it gets one
+retry, then the next model in the list takes over. If every model is busy, the
+job waits 60 s, 120 s and 240 s and goes through the list again each time
+before it gives up. The log names the model that answered.
+
+## Content filter
+
+On by default, so clips are safe to post:
+
+- A clip is skipped if anyone in it uses a racial or other slur. The check
+  covers the words spoken, which are also the captions, and the generated text.
+- Strong swear words are masked in the burned-in captions (`f***`, `s***`,
+  `b****`). The audio isn't changed.
+- Swear words and slurs are removed from titles, descriptions and hooks.
+- In the workflow's `titles.md`, clips with strong language are marked
+  **⚠ strong language**.
+
+The slur list is stored only as hashes. A word list can miss misspellings and
+words the speech-to-text misheard, so watch clips before posting them.
 
 ## Run on GitHub Actions
 
@@ -53,14 +75,21 @@ video and uploads the clips as an artifact you can download for 7 days.
 | `layout` | `streamer` | `streamer`, `general` or `auto` (see Layouts) |
 | `clip_count` | `8` | 1–15 |
 | `start` / `end` | | Optional, in seconds or `[HH:]MM:SS`. Use these to clip part of a long VOD. |
+| `transcript_from_run` | | Optional run ID of an earlier run with the same link, start and end. That run's transcript is reused, so transcription is skipped. |
 
 3. Download the `clips-…` artifact. It contains the clips, `titles.md` (titles,
    descriptions, hook text and timestamps in the original video) and
    `metadata.json`.
 
+Every run also saves a `transcript-…` artifact, even when it fails. If a run
+dies after transcribing (for example, when every Gemini model is busy), start a
+new run with the same inputs and set `transcript_from_run` to the failed run's
+ID. The run ID is the number at the end of the run's URL.
+
 If Kick or YouTube blocks GitHub's servers, the run stops and tells you to use a
 Google Drive link instead. If this repository is public, anyone signed in to
-GitHub can download its artifacts and read its logs.
+GitHub can download its artifacts and read its logs. That includes the
+`transcript-…` artifact, which holds the full transcript of the video.
 
 ## Layouts
 

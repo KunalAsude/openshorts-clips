@@ -26,6 +26,7 @@ from google.genai import types as genai_types
 
 import frame_sampler
 import gpu_decode
+import content_filter
 import gemini_worker
 import hook_grounding
 import layout_picker
@@ -2304,7 +2305,12 @@ def transcribe_video(video_path, slot_timeout=None):
 
     return transcript
 
-CLIP_FALLBACK_DEFAULT = 'gemini-3.1-flash-lite'
+CLIP_FALLBACK_DEFAULT = 'gemini-3.5-flash,gemini-3.7-flash,gemini-3.1-flash-lite'
+
+# Waits before each further pass over the whole chain when every model in it
+# is busy (Gemini "high demand" spells last minutes, not seconds). Three more
+# passes, then the job fails. CLIP_CHAIN_WAITS="60,120,240" overrides it.
+CLIP_CHAIN_WAITS_DEFAULT = (60, 120, 240)
 
 # Failures that say the MODEL is unavailable rather than that the prompt is
 # wrong: overload, quota, server errors, deadlines. A 500 can be the prompt's
@@ -2314,25 +2320,63 @@ CLIP_FALLBACK_DEFAULT = 'gemini-3.1-flash-lite'
 # ("line 1 column 500") and a validation error echoes the model's output.
 _MODEL_BUSY_RE = re.compile(
     r"\b(?:429|500|503|504)\b|UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|INTERNAL"
-    r"|Deadline|DEADLINE_EXCEEDED|timed out|Timeout")
+    r"|high demand|Deadline|DEADLINE_EXCEEDED|timed out|Timeout")
 
-# Set once the primary clip model has been found busy: the rest of this job
-# (one process per job) goes straight to the fallback instead of waiting out
-# the same timeouts batch after batch.
-_clip_model_fell_back = None
+# A model this key cannot use at all (unknown name, not enabled): skip it for
+# the rest of the job instead of failing a run whose other models are fine.
+_MODEL_UNUSABLE_RE = re.compile(
+    r"\b404\b|NOT_FOUND|is not found|not found for API|not supported for|"
+    r"PERMISSION_DENIED", re.IGNORECASE)
+
+# Longest the chain may spend waiting for busy models in one call, so a long
+# outage fails the run in time to save its transcript (CLIP_CHAIN_MAX_SECONDS).
+CLIP_CHAIN_MAX_SECONDS_DEFAULT = 1500
+
+# The model that answered the last call: the next call starts there instead of
+# waiting out the same busy models again (one process per job). And every
+# model that answered, in order, for the cost label.
+_clip_model_current = None
+_clip_models_answered = []
+_clip_models_unusable = set()
+_chain_sleep = time.sleep  # tests replace it
+_chain_clock = time.monotonic
 
 
-def clip_model_names():
-    """(primary, fallback) Gemini models for moment picking.
+def clip_model_chain():
+    """Gemini models for moment picking, in the order they are tried.
 
-    Primary: ``GEMINI_MODEL_CLIPS``, else ``GEMINI_MODEL``, else the repo
-    default. Fallback: ``GEMINI_MODEL_CLIPS_FALLBACK`` (default flash-lite),
-    None when it is the primary itself. Everything else that reads
-    ``GEMINI_MODEL`` (layout picker, hooks, subtitles) is unaffected."""
+    ``GEMINI_MODEL_CLIPS`` (else ``GEMINI_MODEL``, else the repo default),
+    then the comma-separated ``GEMINI_MODEL_CLIPS_FALLBACK`` list (default
+    3.5-flash, 3.7-flash, 3.1-flash-lite), without repeats. Everything else
+    that reads ``GEMINI_MODEL`` (layout picker, hooks, subtitles) is
+    unaffected."""
     primary = (os.environ.get("GEMINI_MODEL_CLIPS") or os.environ.get("GEMINI_MODEL")
                or 'gemini-3.1-flash-lite').strip()
-    fallback = (os.environ.get("GEMINI_MODEL_CLIPS_FALLBACK") or CLIP_FALLBACK_DEFAULT).strip()
-    return primary, (fallback if fallback and fallback != primary else None)
+    raw = os.environ.get("GEMINI_MODEL_CLIPS_FALLBACK")
+    if raw is None or not raw.strip():
+        raw = CLIP_FALLBACK_DEFAULT
+    chain = [primary]
+    for name in raw.split(","):
+        name = name.strip()
+        if name and name not in chain:
+            chain.append(name)
+    return chain
+
+
+def clip_chain_waits():
+    raw = os.environ.get("CLIP_CHAIN_WAITS", "").strip()
+    if raw:
+        try:
+            return tuple(max(0.0, float(x)) for x in raw.split(",") if x.strip())
+        except ValueError:
+            pass
+    return CLIP_CHAIN_WAITS_DEFAULT
+
+
+def _model_unusable(exc):
+    if isinstance(exc, (gemini_worker.GeminiBlockedError, ValueError)):
+        return False
+    return bool(_MODEL_UNUSABLE_RE.search(f"{type(exc).__name__} {exc}"))
 
 
 def _model_busy(exc):
@@ -2345,31 +2389,82 @@ def _model_busy(exc):
     return bool(_MODEL_BUSY_RE.search(f"{type(exc).__name__} {exc}"))
 
 
+class AllModelsBusy(RuntimeError):
+    """Every model in the clip chain stayed busy through every wait."""
+
+
 def clip_models_used(model_name):
     """Label for a stage's total cost: the models that actually answered."""
-    if _clip_model_fell_back and _clip_model_fell_back != model_name:
-        return f"{model_name} -> {_clip_model_fell_back}"
-    return model_name
+    return " -> ".join(_clip_models_answered) or model_name
 
 
 def _with_clip_fallback(call, model_name, label):
-    """``call(model)`` on ``model_name``; if that model is busy after its own
-    retries, once more on the clip fallback model. Only the primary clip
-    model falls back, and never on a local LLM server."""
-    global _clip_model_fell_back
-    primary, fallback = clip_model_names()
-    can_fall_back = (fallback and model_name == primary and not llm_backend.active())
-    if can_fall_back and _clip_model_fell_back:
-        return call(_clip_model_fell_back)
-    try:
+    """``call(model)`` down the clip model chain.
+
+    A busy model (after ``_run_gemini_stage``'s one retry) hands over to the
+    next one; when the whole chain is busy, wait (``clip_chain_waits``) and go
+    round again, then raise ``AllModelsBusy``. A model the key cannot use
+    (unknown, not enabled) is skipped for the rest of the job. Anything else
+    -- a policy block, an answer that does not parse -- is raised at once, on
+    the model that produced it. Never with a local LLM server, and only for a
+    model that is part of the chain."""
+    global _clip_model_current
+    chain = clip_model_chain()
+    if llm_backend.active() or model_name not in chain:
         return call(model_name)
-    except Exception as e:
-        if not can_fall_back or not _model_busy(e):
-            raise
-        print(f"⚠️ {model_name} busy for {label} ({str(e)[:150]}) — "
-              f"using {fallback} for the rest of this job")
-        _clip_model_fell_back = fallback
-        return call(fallback)
+    first = _clip_model_current if _clip_model_current in chain else model_name
+    i = chain.index(first)
+    order = chain[i:] + chain[:i]
+    waits = clip_chain_waits()
+    try:
+        cap = float(os.environ.get("CLIP_CHAIN_MAX_SECONDS") or CLIP_CHAIN_MAX_SECONDS_DEFAULT)
+    except ValueError:
+        cap = CLIP_CHAIN_MAX_SECONDS_DEFAULT
+    started = _chain_clock()
+    last = None
+    for round_no in range(len(waits) + 1):
+        order = [m for m in order if m not in _clip_models_unusable]
+        if not order:
+            # Raised as AllModelsBusy so the job fails with this reason, not
+            # the generic "no clips found".
+            raise AllModelsBusy(
+                f"No clip model in {', '.join(chain)} can be used with this key "
+                f"(check GEMINI_MODEL_CLIPS / GEMINI_MODEL_CLIPS_FALLBACK): {str(last)[:200]}")
+        if round_no:
+            wait = waits[round_no - 1]
+            if _chain_clock() - started + wait > cap:
+                print(f"⏱️ Clip models still busy after {_chain_clock() - started:.0f}s; "
+                      f"giving up (cap {cap:.0f}s)")
+                break
+            print(f"⏳ Every clip model is busy ({', '.join(order)}); "
+                  f"waiting {wait:.0f}s before pass {round_no + 1}/{len(waits) + 1}")
+            _chain_sleep(wait)
+        for model in order:
+            if model in _clip_models_unusable:
+                continue
+            try:
+                result = call(model)
+            except Exception as e:
+                if _model_unusable(e):
+                    _clip_models_unusable.add(model)
+                    last = e
+                    print(f"⚠️ {model} can't be used ({str(e)[:150]}); skipping it")
+                    continue
+                if not _model_busy(e):
+                    raise
+                last = e
+                print(f"⚠️ {model} busy for {label}: {str(e)[:150]}")
+                continue
+            if model != _clip_model_current:
+                print(f"🤖 {label}: answered by {model}")
+            _clip_model_current = model
+            if model not in _clip_models_answered:
+                _clip_models_answered.append(model)
+            return result
+    raise AllModelsBusy(
+        f"Every clip model was busy ({', '.join(chain)}); the job stopped after "
+        f"waiting. Run it again later (the workflow can reuse this run's "
+        f"transcript). Last error: {str(last)[:200]}")
 
 
 def _run_gemini_stage(client, model_name, prompt, schema):
@@ -2411,16 +2506,22 @@ def _run_gemini_stage(client, model_name, prompt, schema):
             raise  # deterministic policy block — never retry
         except Exception as e:
             msg = str(e)
-            transient = any(tok in msg for tok in (
+            seen = f"{type(e).__name__} {msg}"  # a bare ReadTimeout has no message
+            transient = any(tok in seen for tok in (
                 '503', 'UNAVAILABLE', '429', 'RESOURCE_EXHAUSTED',
-                '500', 'INTERNAL', 'overloaded', 'Deadline',
+                '500', 'INTERNAL', 'overloaded', 'Deadline', 'high demand',
+                'timed out', 'Timeout',
                 'empty response body', 'did not contain a JSON object',
                 'Failed to parse Gemini JSON response',
                 # OpenAI-compatible servers: model still loading, busy, or a
                 # small model that skipped a required field this time.
                 'ConnectError', 'ReadTimeout', 'RemoteProtocolError', '502', '504',
                 'validation error'))
-            if attempt == max_attempts or not transient:
+            # A busy Gemini model gets ONE retry here; after that the clip
+            # model chain (_with_clip_fallback) moves on to the next model
+            # instead of hammering this one. Bad answers keep all three tries.
+            limit = 2 if (not use_local and _model_busy(e)) else max_attempts
+            if attempt >= limit or not transient:
                 raise
             wait = 5 * (2 ** (attempt - 1))
             who = "LLM server" if use_local else "Gemini"
@@ -2495,9 +2596,10 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
                   "(set it, or point LLM_BASE_URL at an OpenAI-compatible server).")
             return None
         client = genai.Client(api_key=api_key)
-        model_name, fallback_model = clip_model_names()
-        if fallback_model:
-            print(f"\U0001f916  Fallback model when busy: {fallback_model}")
+        chain = clip_model_chain()
+        model_name = chain[0]
+        if len(chain) > 1:
+            print(f"\U0001f916  Fallback models when busy: {', '.join(chain[1:])}")
     print(f"\U0001f916  Model: {model_name} | language: {language}")
 
     # Full word list — ground truth for snapping cut points.
@@ -2590,7 +2692,8 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
                     video_duration=video_duration, language=language,
                     min_clips=lo, max_clips=hi,
                     min_secs=min_secs, max_secs=max_secs,
-                    windows_json=json.dumps(_payload(ws), ensure_ascii=False))
+                    windows_json=json.dumps(_payload(ws), ensure_ascii=False)
+                ) + content_filter.prompt_rule()
             return build
 
         shorts = []
@@ -2665,9 +2768,10 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
         if cost_analysis:
             result["cost_analysis"] = cost_analysis
         return result
-    except gemini_worker.GeminiBlockedError as e:
-        # Content-policy rejection: propagate so the job fails with the real
-        # reason instead of a generic "no clips found".
+    except (gemini_worker.GeminiBlockedError, AllModelsBusy) as e:
+        # Content-policy rejection, or every model busy through every wait:
+        # propagate so the job fails with the real reason instead of a
+        # generic "no clips found".
         print(f"🚫 {e}")
         raise
     except Exception as e:
@@ -2782,7 +2886,7 @@ def _visual_pass(client, model_name, video_path, duration, language,
         prompt = gemini_worker.VISUAL_PROMPT_TEMPLATE.format(
             video_duration=duration, language=language,
             min_clips=min_clips, max_clips=max_clips,
-            min_secs=min_secs, max_secs=max_secs) + (hint or "")
+            min_secs=min_secs, max_secs=max_secs) + (hint or "") + content_filter.prompt_rule()
         config = genai_types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=gemini_worker.VisualResponse,
@@ -2829,7 +2933,7 @@ def get_visual_clips(video_path, video_duration, language="en", viewer_clips=Non
             print("❌ Error: GEMINI_API_KEY not found.")
         return None
     client = genai.Client(api_key=api_key)
-    model_name, _fallback = clip_model_names()
+    model_name = clip_model_chain()[0]
 
     # The vision path has no scoring windows to derive a count from, so the
     # env targets (user request) apply directly over the classic 3-15.
@@ -2873,8 +2977,8 @@ def get_visual_clips(video_path, video_duration, language="en", viewer_clips=Non
                             per_min, per_max, v_min_secs, v_max_secs,
                             hint=_viewer_hint(viewer_clips, s0, s1 - s0)),
                         model_name, f"vision stretch {i + 1}")
-                except gemini_worker.GeminiBlockedError:
-                    raise
+                except (gemini_worker.GeminiBlockedError, AllModelsBusy):
+                    raise  # an all-busy chain would only wait again per stretch
                 except Exception as e:
                     # One bad stretch must not sink the other hours.
                     print(f"⚠️ Vision stretch {i + 1}/{len(segments)} failed: {e}")
@@ -2903,7 +3007,7 @@ def get_visual_clips(video_path, video_duration, language="en", viewer_clips=Non
         if cost:
             result["cost_analysis"] = cost
         return result
-    except gemini_worker.GeminiBlockedError as e:
+    except (gemini_worker.GeminiBlockedError, AllModelsBusy) as e:
         print(f"🚫 {e}")
         raise
     except Exception as e:
@@ -3188,6 +3292,9 @@ if __name__ == '__main__':
                     raise ValueError("transcript has no segments")
                 print(f"⏩ Reusing precomputed transcript "
                       f"({len(transcript['segments'])} segments) — skipping transcription.")
+                # Same checkpoint a fresh transcription leaves, so a run that
+                # reused a transcript can hand it on again if it fails.
+                save_transcript_checkpoint(output_dir, transcript, input_video, duration)
             except Exception as e:
                 print(f"⚠️ Could not use precomputed transcript ({e}) — transcribing normally.")
                 transcript = None
@@ -3245,6 +3352,16 @@ if __name__ == '__main__':
             clips_data = get_viral_clips(transcript, duration, viewer_clips=viewer_clips)
         else:
             clips_data = get_visual_clips(input_video, duration, viewer_clips=viewer_clips)
+
+        # Content filter (CONTENT_FILTER=0 turns it off): drop clips with a
+        # slur, strip swearing from the copy, flag strong language.
+        if clips_data and clips_data.get('shorts'):
+            picked = len(clips_data['shorts'])
+            clips_data['shorts'] = content_filter.apply(clips_data['shorts'], transcript)
+            if not clips_data['shorts']:
+                raise RuntimeError(
+                    f"All {picked} clips the AI picked contain a slur, so none were made "
+                    "(CONTENT_FILTER=0 turns the content filter off).")
 
         if not clips_data or 'shorts' not in clips_data:
             # Deliberately fail instead of reframing the whole video: that path
@@ -3316,6 +3433,7 @@ if __name__ == '__main__':
                     # and title from three of its frames BEFORE burning them.
                     if success and hook_grounding.wanted(clip['layout_ranges'], end - start):
                         hook_grounding.reground(clip_final_path, clip, transcript, start, end)
+                        content_filter.clean_clip_text(clip)  # the new hook/title too
                     captioned = None
                     # Pro mode replaces the file the hook and the captions go
                     # on, and the timeline they are laid on (its cuts); the

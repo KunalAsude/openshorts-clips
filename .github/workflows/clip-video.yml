@@ -40,9 +40,15 @@ on:
         required: false
         default: ""
         type: string
+      transcript_from_run:
+        description: "Optional run ID of an earlier run of this video (same link, start and end): reuse its transcript and skip transcription"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
+  actions: read   # download the transcript artifact of an earlier run
 
 jobs:
   clip:
@@ -130,6 +136,16 @@ jobs:
           ls -lh "$RUNNER_TEMP/source.$ext"
           echo "SOURCE=$RUNNER_TEMP/source.$ext" >> "$GITHUB_ENV"
 
+      - name: Get the transcript from the earlier run
+        if: ${{ inputs.transcript_from_run != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.transcript_from_run }}
+          github-token: ${{ github.token }}
+          pattern: transcript-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/prev-transcript
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Build the OpenShorts backend image
@@ -165,15 +181,57 @@ jobs:
 
       - name: Clip
         env:
+          VIDEO_URL: ${{ inputs.video_url }}
           LAYOUT: ${{ inputs.layout }}
           CLIP_COUNT: ${{ inputs.clip_count }}
           START: ${{ inputs.start }}
           END: ${{ inputs.end }}
+          REUSE_RUN: ${{ inputs.transcript_from_run }}
         run: |
+          reuse=()
+          if [ -n "$REUSE_RUN" ]; then
+            reuse=(--transcript "$RUNNER_TEMP/prev-transcript/transcript.json"
+                   --transcript-manifest "$RUNNER_TEMP/prev-transcript/manifest.json")
+          fi
           python3 .github/scripts/run_clip_job.py \
             --source "$SOURCE" --out "$GITHUB_WORKSPACE/clips" --workdir "$RUNNER_TEMP" \
+            --video-url "$VIDEO_URL" --state-dir "$RUNNER_TEMP/clip-state" \
             --layout "$LAYOUT" --clips "$CLIP_COUNT" --start "$START" --end "$END" \
-            --finish-by "$FINISH_BY"
+            --finish-by "$FINISH_BY" "${reuse[@]}"
+
+      # Runs on failure too: transcription is the slow part, and a later run
+      # (transcript_from_run = this run's ID) can start from it.
+      - name: Save the transcript
+        if: always()
+        run: |
+          state="$RUNNER_TEMP/clip-state/job.json"
+          [ -f "$state" ] || { echo "No job was started; nothing to save."; exit 0; }
+          job_id=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["job_id"])' "$state")
+          case "$job_id" in *[!A-Za-z0-9_-]*|"") echo "Unexpected job id"; exit 0 ;; esac
+          mkdir -p "$RUNNER_TEMP/transcript-out"
+          if ! docker cp "openshorts:/app/output/$job_id/.transcript_checkpoint.json" \
+                 "$RUNNER_TEMP/checkpoint.json" 2> /dev/null; then
+            echo "The job stopped before transcribing; nothing to save."
+            exit 0
+          fi
+          python3 - "$RUNNER_TEMP/checkpoint.json" "$state" "$RUNNER_TEMP/transcript-out" <<'PY'
+          import json, os, sys
+          checkpoint, state, out = sys.argv[1:4]
+          transcript = json.load(open(checkpoint))["transcript"]
+          json.dump(transcript, open(os.path.join(out, "transcript.json"), "w"))
+          json.dump(json.load(open(state))["manifest"],
+                    open(os.path.join(out, "manifest.json"), "w"), indent=2)
+          print(f"Saved transcript: {len(transcript.get('segments', []))} segments")
+          PY
+
+      - name: Upload the transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: transcript-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/transcript-out/
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: Backend log on failure
         if: failure()
