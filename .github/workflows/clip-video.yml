@@ -1,0 +1,188 @@
+name: Clip a video
+
+# Runs the whole OpenShorts pipeline on a GitHub runner, no web UI:
+# download -> backend container (the repo's own Dockerfile) -> /api/process
+# -> clips + titles/descriptions uploaded as a 7-day artifact.
+#
+# Secrets (Settings > Secrets and variables > Actions):
+#   GEMINI_API_KEY      required
+#   GEMINI_MODEL_CLIPS  optional, the moment-picking model (e.g. gemini-3.7-flash);
+#                       falls back to gemini-3.1-flash-lite when it is busy.
+#
+# Artifacts and logs of a public repository can be read by anyone signed in to
+# GitHub.
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Kick, YouTube or Google Drive link (Drive: shared as 'Anyone with the link'). This repo is public: anyone signed in to GitHub can download the clips."
+        required: true
+        type: string
+      layout:
+        description: "streamer = facecam over gameplay, general = blurred background, auto = AI picks"
+        required: true
+        default: streamer
+        type: choice
+        options: [streamer, general, auto]
+      clip_count:
+        description: "Clips to aim for (1-15)"
+        required: true
+        default: "8"
+        type: string
+      start:
+        description: "Optional start, seconds or [HH:]MM:SS (e.g. 35:00); snaps back to the previous keyframe (~2 s on stream VODs)"
+        required: false
+        default: ""
+        type: string
+      end:
+        description: "Optional end, seconds or [HH:]MM:SS (e.g. 1:10:00)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  clip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Check secrets
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "::error::Add the GEMINI_API_KEY repository secret first."
+            exit 1
+          fi
+          # The clip step must finish 20 minutes before the 350-minute job
+          # timeout, so the artifact still uploads: the budget counts from here.
+          echo "FINISH_BY=$(( $(date +%s) + 330 * 60 ))" >> "$GITHUB_ENV"
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af > /dev/null
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install download tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg > /dev/null
+          # curl-cffi lets yt-dlp impersonate a browser, which some sites
+          # (Kick sits behind Cloudflare) require.
+          pip install --quiet "yt-dlp[default,curl-cffi]" gdown
+
+      - name: Download video
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/input"
+          host=$(python3 -c 'import sys, urllib.parse; print((urllib.parse.urlparse(sys.argv[1].strip()).hostname or "").lower())' "$VIDEO_URL")
+          case "$host" in
+            drive.google.com|docs.google.com) kind=drive ;;
+            kick.com|*.kick.com|youtube.com|*.youtube.com|youtu.be) kind=ytdlp ;;
+            *) echo "::error::Unsupported link host '$host'. Use a Kick, YouTube or Google Drive link."
+               exit 1 ;;
+          esac
+          log="$RUNNER_TEMP/download.log"
+          set +e
+          if [ "$kind" = drive ]; then
+            gdown --fuzzy "$VIDEO_URL" -O "$RUNNER_TEMP/input/" 2>&1 | tee "$log"
+          else
+            yt-dlp --no-playlist --no-progress \
+              -f 'b[height<=1080]/bv*[height<=1080]+ba/b' --merge-output-format mp4 \
+              -o "$RUNNER_TEMP/input/source.%(ext)s" -- "$VIDEO_URL" 2>&1 | tee "$log"
+          fi
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            if [ "$kind" = drive ]; then
+              echo "::error::Google Drive download failed. Share the file as 'Anyone with the link' and run again with that link."
+            elif grep -qiE 'HTTP Error (403|429)|403: Forbidden|429: Too Many Requests|cloudflare|sign in to confirm|not a bot|(is|been) blocked|geo.?restrict|unable to download (api page|webpage)' "$log"; then
+              echo "::error::$host blocked the download from GitHub's servers. Upload the video to Google Drive, share it as 'Anyone with the link', and run this workflow again with the Drive link."
+            else
+              echo "::error::Download failed (see the log above). If it keeps failing, use a Google Drive link instead."
+            fi
+            exit 1
+          fi
+          src=$(find "$RUNNER_TEMP/input" -type f ! -name '*.part' ! -name '*.ytdl' | head -n 1)
+          if [ -z "$src" ]; then
+            echo "::error::The download finished but no video file was found."
+            exit 1
+          fi
+          # A fixed name: a Drive file name can hold ; , or " that curl's -F
+          # would read as extra form parameters.
+          ext="${src##*.}"; case "$ext" in mp4|mkv|mov|webm|ts|m4v) ;; *) ext=mp4 ;; esac
+          mv "$src" "$RUNNER_TEMP/source.$ext"
+          ls -lh "$RUNNER_TEMP/source.$ext"
+          echo "SOURCE=$RUNNER_TEMP/source.$ext" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the OpenShorts backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: openshorts-backend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+
+      - name: Start OpenShorts
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL_CLIPS: ${{ secrets.GEMINI_MODEL_CLIPS }}
+        run: |
+          # -e NAME (no value) copies the variable from this step's env, so
+          # the key never appears in a command line or in the log. No volume:
+          # the image runs as a non-root user that could not write to a
+          # runner directory, and the clips are fetched over HTTP anyway.
+          docker run -d --name openshorts -p 8000:8000 \
+            -e GEMINI_API_KEY -e GEMINI_MODEL_CLIPS \
+            -e GEMINI_MODEL_CLIPS_FALLBACK=gemini-3.1-flash-lite \
+            openshorts-backend:ci > /dev/null
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:8000/health/ready > /dev/null && { echo "OpenShorts is up"; exit 0; }
+            [ "$(docker inspect -f '{{.State.Running}}' openshorts)" = true ] || break
+            sleep 2
+          done
+          echo "::error::OpenShorts did not start."
+          docker logs --tail 100 openshorts
+          exit 1
+
+      - name: Clip
+        env:
+          LAYOUT: ${{ inputs.layout }}
+          CLIP_COUNT: ${{ inputs.clip_count }}
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
+        run: |
+          python3 .github/scripts/run_clip_job.py \
+            --source "$SOURCE" --out "$GITHUB_WORKSPACE/clips" --workdir "$RUNNER_TEMP" \
+            --layout "$LAYOUT" --clips "$CLIP_COUNT" --start "$START" --end "$END" \
+            --finish-by "$FINISH_BY"
+
+      - name: Backend log on failure
+        if: failure()
+        run: docker logs --tail 200 openshorts 2>&1 || true
+
+      - name: Upload clips
+        uses: actions/upload-artifact@v4
+        with:
+          name: clips-${{ github.run_number }}-${{ github.run_attempt }}
+          path: clips/
+          retention-days: 7
+          if-no-files-found: error
