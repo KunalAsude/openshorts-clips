@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket } from 'lucide-react';
+import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Loader2, Download, Menu, Lock, Rocket, Clapperboard } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import McpConnectCard from './components/McpConnectCard';
@@ -17,7 +17,6 @@ import UsageMeter from './components/UsageMeter';
 import TopUpModal from './components/TopUpModal';
 import WatermarkModal, { watermarkNoticeDismissed } from './components/WatermarkModal';
 import { getApiUrl } from './config';
-import StarBanner from './components/StarBanner';
 import PlanChoiceModal from './components/PlanChoiceModal';
 import ClipTutorial from './components/ClipTutorial';
 import OnboardingSurvey from './components/OnboardingSurvey';
@@ -1476,26 +1475,11 @@ function App() {
   };
   const tabLocked = (id) => tutorialLock && id !== 'dashboard';
 
-  // Shared footer links (landing, repo, pricing, contact) — same list in the
-  // desktop rail and the mobile drawer, so they can never drift apart.
+  // Shared footer links — same list in the desktop rail and the mobile
+  // drawer, so they can never drift apart. Clip Studio keeps only the plans
+  // link, which exists only with billing on.
   const NavFooterLinks = ({ collapsed = false }) => (
     <>
-      <a
-        href="#landing"
-        className="flex items-center gap-2 px-3 py-2 text-xs lowercase text-muted hover:text-ink2 transition-colors"
-      >
-        <Globe size={14} className="shrink-0" />
-        <span className={collapsed ? 'hidden lg:block truncate' : 'truncate'}>landing page</span>
-      </a>
-      <a
-        href="https://github.com/mutonby/openshorts"
-        target="_blank"
-        rel="noopener noreferrer"
-        className="flex items-center gap-2 px-3 py-2 text-xs lowercase text-muted hover:text-ink2 transition-colors"
-      >
-        <svg height="14" viewBox="0 0 16 16" version="1.1" width="14" aria-hidden="true" fill="currentColor" className="shrink-0"><path fillRule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>
-        <span className={collapsed ? 'hidden lg:block truncate' : 'truncate'}>open source</span>
-      </a>
       {billingEnabled && (
         <a
           href="#/pricing"
@@ -1505,13 +1489,6 @@ function App() {
           <span className={collapsed ? 'hidden lg:block truncate' : 'truncate'}>plans &amp; pricing</span>
         </a>
       )}
-      <a
-        href="mailto:info@openshorts.app"
-        className="flex items-center gap-2 px-3 py-2 text-xs lowercase text-muted hover:text-ink2 transition-colors"
-      >
-        <Mail size={14} className="shrink-0" />
-        <span className={collapsed ? 'hidden lg:block truncate' : 'truncate'}>info@openshorts.app</span>
-      </a>
     </>
   );
 
@@ -1519,11 +1496,11 @@ function App() {
   // entirely — an unlabelled 80px rail ate a fifth of a phone screen.
   const Sidebar = () => (
     <div className="hidden md:flex w-20 lg:w-64 bg-paper2 border-r border-rule flex-col h-full shrink-0 transition-all duration-300">
-      <a href="#app" onClick={() => goToTab('dashboard')} className="p-6 flex items-center gap-3" title="openshorts home">
+      <a href="#app" onClick={() => goToTab('dashboard')} className="p-6 flex items-center gap-3" title="clip studio home">
         <div className="w-8 h-8 bg-paper3 rounded-input flex items-center justify-center shrink-0 overflow-hidden border border-rule">
-          <img src="/logo-openshorts.png" alt="Logo" className="w-full h-full object-cover" />
+          <Clapperboard size={16} className="text-brass" aria-label="Clip Studio" />
         </div>
-        <span className="font-display lowercase text-lg text-ink hidden lg:block">openshorts</span>
+        <span className="font-display lowercase text-lg text-ink hidden lg:block">clip studio</span>
       </a>
 
       <nav className="flex-1 px-4 py-4 space-y-1">
@@ -1576,10 +1553,10 @@ function App() {
       <div className="relative w-[17rem] max-w-[82vw] h-full bg-paper2 border-r border-rule flex flex-col animate-slide-in-left">
         <div className="flex items-center justify-between px-5 h-14 border-b border-rule shrink-0">
           <a href="#app" className="flex items-center gap-2.5" onClick={() => goToTab('dashboard')}>
-            <div className="w-7 h-7 bg-paper3 rounded-input overflow-hidden border border-rule shrink-0">
-              <img src="/logo-openshorts.png" alt="" className="w-full h-full object-cover" />
+            <div className="w-7 h-7 bg-paper3 rounded-input overflow-hidden border border-rule shrink-0 flex items-center justify-center">
+              <Clapperboard size={14} className="text-brass" aria-hidden="true" />
             </div>
-            <span className="font-display lowercase text-lg text-ink">openshorts</span>
+            <span className="font-display lowercase text-lg text-ink">clip studio</span>
           </a>
           <button
             onClick={() => setNavOpen(false)}
@@ -1765,10 +1742,10 @@ function App() {
                 <span className="font-medium text-ink">Required API keys missing.</span>{' '}
                 <span className="text-muted">
                   {!geminiOk && !uploadPostKey
-                    ? 'Set your Gemini and Upload-Post API keys to use OpenShorts.'
+                    ? 'Set your Gemini and Upload-Post API keys to use Clip Studio.'
                     : !geminiOk
-                      ? 'Set your Gemini API key to use OpenShorts.'
-                      : 'Set your Upload-Post API key to use OpenShorts.'}
+                      ? 'Set your Gemini API key to use Clip Studio.'
+                      : 'Set your Upload-Post API key to use Clip Studio.'}
                 </span>
               </div>
             </div>
@@ -2401,14 +2378,6 @@ function App() {
                   </div>
                 )}
 
-                {/* The render is dead time: the user is watching a progress bar
-                    with nothing to do, so this is where the one star ask goes. */}
-                {status === 'processing' && (
-                  <div className="my-3">
-                    <StarBanner message="Got a minute while this renders?" />
-                  </div>
-                )}
-
                 {/* Logs Terminal */}
                 <div className={`bg-paper rounded-card border border-rule overflow-hidden flex flex-col transition-all duration-500 ${status === 'complete' ? `min-h-0 opacity-50 hover:opacity-100 ${logsVisible ? 'h-32' : 'h-auto'}` : `flex-1 ${logsVisible ? 'min-h-[160px] sm:min-h-[200px]' : 'min-h-0 flex-none'}`}`}>
                   <button
@@ -2729,7 +2698,7 @@ function App() {
       >
         <div className="space-y-4">
           <p className="text-sm text-muted">
-            OpenShorts needs both a <strong className="text-ink2">Gemini</strong> API key and an <strong className="text-ink2">Upload-Post</strong> API key. Both have free tiers.
+            Clip Studio needs both a <strong className="text-ink2">Gemini</strong> API key and an <strong className="text-ink2">Upload-Post</strong> API key. Both have free tiers.
           </p>
 
           {/* Gemini block */}

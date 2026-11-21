@@ -112,14 +112,12 @@ function Root() {
     if (hash.startsWith('#/pricing')) return 'pricing';
     if (hash.startsWith('#/login')) return 'login';
     if (hash === '#legal') return 'legal';
-    // The app lives at #app (and #app?tab=… deep links). Everything else,
-    // including a bare / and the section anchors (#features, #pricing…) and
-    // #landing, is the landing page. There is deliberately no "returning
-    // visitor" shortcut into the app: the static fallback is the landing, so
-    // swapping it for the app after hydration made / jump a second after load,
-    // and the logo of every page has to reach the landing.
-    if (hash === '#app' || hash.startsWith('#app?') || hash === '#/app') return 'app';
-    return 'landing';
+    // Clip Studio opens straight into the app: a bare /, #app and every other
+    // hash land there. The marketing landing is kept, reachable only at
+    // #landing and its own section anchors.
+    if (['#landing', '#features', '#how-it-works', '#platforms', '#comparison',
+         '#pricing', '#faq'].includes(hash)) return 'landing';
+    return 'app';
   };
 
   const [view, setView] = useState(resolveView);
