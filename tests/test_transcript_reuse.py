@@ -120,3 +120,104 @@ class TestMainSavesReusedTranscript:
         main.save_transcript_checkpoint(str(tmp_path), transcript, "/x/upload.mp4", 2101.3)
         with open(tmp_path / main.TRANSCRIPT_CHECKPOINT) as f:
             assert json.load(f)["transcript"] == transcript
+
+
+class TestSectionDownload:
+    """Kick/YouTube with start/end: the workflow downloads only that section,
+    the helper does not cut it again, and the manifest and titles.md still
+    speak in the original VOD's link and times."""
+
+    WORKFLOW = os.path.join(os.path.dirname(__file__), "..", ".github", "workflows",
+                            "clip-video.yml")
+
+    @pytest.mark.parametrize("start,end,spec", [
+        ("35:00", "1:10:00", "*2100-4200"),
+        ("35:00", "", "*2100-inf"),
+        ("", "600", "*0-600"),
+        ("", "", None),
+    ])
+    def test_section_spec(self, start, end, spec):
+        h = _helper()
+        assert h.section_spec(h.parse_time(start), h.parse_time(end)) == spec
+
+    def test_end_before_start_is_refused(self, capsys):
+        h = _helper()
+        with pytest.raises(SystemExit):
+            h.section_spec(600.0, 500.0)
+        assert "::error::" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("start,end,duration,offset", [
+        (2100.0, 4200.0, 2101.8, 2098.2),   # starts at the keyframe 1.8 s early
+        (60.0, 90.0, 30.033, 59.967),
+        (2100.0, 99999.0, 3000.0, 2100.0),  # end past the VOD: measured is nonsense
+        (2100.0, None, 5000.0, 2100.0),     # open end: the requested start
+        (None, 600.0, 600.0, 0.0),
+    ])
+    def test_section_offset(self, start, end, duration, offset):
+        assert _helper().section_offset(start, end, duration) == pytest.approx(offset, abs=0.01)
+
+    def _run(self, tmp_path, monkeypatch, extra, source_seconds):
+        """main() with the API, ffmpeg and ffprobe stubbed: returns (ffmpeg
+        commands, the state manifest, titles.md)."""
+        h = _helper()
+        src = tmp_path / "source.mp4"
+        src.write_bytes(b"x" * 1000)
+        ffmpeg = []
+
+        def fake_run(cmd, **kw):
+            ffmpeg.append(cmd)
+            open(cmd[-1], "wb").write(b"x" * 1000)
+
+            class R:
+                returncode = 0
+            return R()
+        monkeypatch.setattr(h.subprocess, "run", fake_run)
+        monkeypatch.setattr(h, "probe", lambda path: (source_seconds if path == str(src) else 2100.0, 1080))
+        monkeypatch.setattr(h, "submit", lambda *a, **k: "job1")
+        result = {"clips": [{"video_url": "/videos/job1/a.mp4", "start": 10.0, "end": 40.0,
+                             "video_title_for_youtube_short": "Tigers"}]}
+        monkeypatch.setattr(h, "follow", lambda *a: ("completed", result))
+        monkeypatch.setattr(h, "download", lambda url, dest: open(dest, "wb").write(b"v"))
+        monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+        out, state = tmp_path / "clips", tmp_path / "state"
+        h.main(["--source", str(src), "--out", str(out), "--workdir", str(tmp_path),
+                "--video-url", "https://kick.com/x/videos/1", "--state-dir", str(state),
+                "--start", "35:00", "--end", "1:10:00", *extra])
+        manifest = json.loads((state / "job.json").read_text())["manifest"]
+        return ffmpeg, manifest, (out / "titles.md").read_text()
+
+    def test_section_is_not_cut_again(self, tmp_path, monkeypatch):
+        ffmpeg, manifest, titles = self._run(tmp_path, monkeypatch, ["--source-is-section"], 2101.8)
+        assert ffmpeg == []                                   # no second cut
+        assert manifest == {"video_url": "https://kick.com/x/videos/1",
+                            "start": 2100.0, "end": 4200.0, "duration": 2101.8}
+        # 10 s into a section that starts at 2098.2 s (35:00 minus the keyframe)
+        assert "0:35:08-0:35:38 in the VOD" in titles
+
+    def test_whole_download_is_still_cut(self, tmp_path, monkeypatch):
+        ffmpeg, manifest, titles = self._run(tmp_path, monkeypatch, [], 36000.0)  # the whole 10 h VOD
+        assert len(ffmpeg) == 1 and "-ss" in ffmpeg[0] and "2100.0" in ffmpeg[0]
+        assert manifest == {"video_url": "https://kick.com/x/videos/1",
+                            "start": 2100.0, "end": 4200.0, "duration": 2100.0}
+        assert "0:35:10-0:35:40 in the VOD" in titles
+
+    def test_workflow_downloads_only_the_section_for_ytdlp(self):
+        text = open(self.WORKFLOW, encoding="utf-8").read()
+        ytdlp = text[text.index("yt-dlp --no-playlist"):]
+        ytdlp = ytdlp[:ytdlp.index("-- \"$VIDEO_URL\"")]
+        assert '"${sections[@]}"' in ytdlp
+        assert "--force-keyframes-at-cuts" not in text      # no re-encode
+        gdown = text[text.index("gdown --fuzzy"):].splitlines()[0]
+        assert "section" not in gdown                         # Drive unchanged
+        assert 'if [ "$kind" = ytdlp ] && [ -n "$section" ]' in text
+        assert "--source-is-section" in text
+
+    def test_format_prefers_1080p_h264_and_never_av1(self):
+        text = open(self.WORKFLOW, encoding="utf-8").read()
+        fmt = text[text.index("-f 'bv*"):].split("'")[1]
+        choices = fmt.split("/")
+        # Separate streams first (YouTube's combined files stop at 360p),
+        # H.264 first, AV1 excluded (the backend cannot decode it).
+        assert choices[0] == "bv*[height<=1080][vcodec^=avc1]+ba"
+        assert choices[1] == "bv*[height<=1080][vcodec!^=av01]+ba"
+        assert choices[2:] == ["b[height<=1080]", "b"]

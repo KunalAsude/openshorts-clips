@@ -4,7 +4,8 @@
 Used by .github/workflows/clip-video.yml, but works against any self-hosted
 instance: ``python run_clip_job.py --source video.mp4 --out clips/``.
 
-Steps: optionally cut the source to [start, end], re-encode it when it is over
+Steps: optionally cut the source to [start, end] (unless the workflow already
+downloaded only that section: --source-is-section), re-encode it when it is over
 the upload limit, upload it to /api/process, follow /api/status until the job
 ends, then download every clip and write metadata.json + titles.md next to
 them. Standard library only; needs curl, ffmpeg and ffprobe on PATH. Never
@@ -66,15 +67,52 @@ def hms(seconds):
     return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
 
-def prepare(source, start, end, workdir):
+# A section download is a stream copy (no forced keyframes), so it starts at
+# the keyframe at or before ``start``: up to a few seconds early. A measured
+# offset further off than this is not that, and ``start`` is used instead.
+SECTION_SLACK_SECONDS = 15.0
+
+
+def section_spec(start, end):
+    """yt-dlp ``--download-sections`` value for [start, end] in seconds of the
+    VOD, or None when neither is set (download the whole video)."""
+    if start is None and end is None:
+        return None
+    if start is not None and end is not None and end <= start:
+        fail(f"End ({end:.0f}s) must be after start ({start:.0f}s).")
+    s = f"{start:g}" if start is not None else "0"
+    e = f"{end:g}" if end is not None else "inf"
+    return f"*{s}-{e}"
+
+
+def section_offset(start, end, duration):
+    """Where a section download of [start, end] begins in the VOD. With an
+    end, measured as for a stream-copy cut (it ends at ``end``); without one,
+    the requested start, since the file runs to the VOD's end."""
+    s = start or 0.0
+    if end is None or start is None:
+        return s
+    measured = end - duration
+    if s - SECTION_SLACK_SECONDS <= measured <= s:
+        return max(0.0, measured)
+    return s
+
+
+def prepare(source, start, end, workdir, is_section=False):
     """(file to upload, its offset in the source in seconds): cut to
-    [start, end] and re-encoded only if needed."""
+    [start, end] and re-encoded only if needed. ``is_section``: ``source`` is
+    already only [start, end] of the VOD (yt-dlp --download-sections), so it
+    is not cut again; the offset still maps clip times back onto the VOD."""
     duration, height = probe(source)
     offset = 0.0
     print(f"Source: {duration / 60:.1f} min, {height}p, "
           f"{os.path.getsize(source) / 1024 ** 3:.2f} GB", flush=True)
     path = source
-    if start is not None or end is not None:
+    if is_section:
+        offset = section_offset(start, end, duration)
+        print(f"Downloaded only the section from {hms(offset)}: not cutting it again",
+              flush=True)
+    elif start is not None or end is not None:
         s = start or 0.0
         e = min(end, duration) if end is not None else duration
         if e <= s:
@@ -258,8 +296,8 @@ def collect(api, result, out, offset=0.0):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--source", required=True)
-    p.add_argument("--out", required=True)
+    p.add_argument("--source")
+    p.add_argument("--out")
     p.add_argument("--workdir", default=".")
     p.add_argument("--api", default="http://localhost:8000")
     p.add_argument("--layout", default="streamer")
@@ -267,6 +305,10 @@ def main(argv=None):
     p.add_argument("--facecam-box", default="",
                    help="x,y,w,h of the webcam in percent of the frame (streamer layout)")
     p.add_argument("--creator-name", default="", help="name used in titles and hooks")
+    p.add_argument("--source-is-section", action="store_true",
+                   help="--source is already only start-end of the VOD")
+    p.add_argument("--section-spec", action="store_true",
+                   help="print the yt-dlp --download-sections value for --start/--end and exit")
     p.add_argument("--start", default="")
     p.add_argument("--end", default="")
     p.add_argument("--video-url", default="",
@@ -285,6 +327,11 @@ def main(argv=None):
                         "workflow passes its own budget, so download, build "
                         "and re-encode time count too)")
     a = p.parse_args(argv)
+    if a.section_spec:
+        print(section_spec(parse_time(a.start), parse_time(a.end)) or "")
+        return 0
+    if not a.source or not a.out:
+        p.error("--source and --out are required")
 
     layout = a.layout.strip().lower()
     if layout not in LAYOUTS:
@@ -302,7 +349,8 @@ def main(argv=None):
         facecam_box = ""
 
     stop_at = a.finish_by or (time.time() + a.deadline_minutes * 60)
-    path, offset = prepare(a.source, parse_time(a.start), parse_time(a.end), a.workdir)
+    path, offset = prepare(a.source, parse_time(a.start), parse_time(a.end), a.workdir,
+                           is_section=a.source_is_section)
     # Seconds, so "35:00" and "2100" count as the same start.
     manifest = {"video_url": a.video_url, "start": parse_time(a.start), "end": parse_time(a.end),
                 "duration": round(probe(path)[0], 2)}

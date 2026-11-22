@@ -104,8 +104,15 @@ jobs:
       - name: Download video
         env:
           VIDEO_URL: ${{ inputs.video_url }}
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
         run: |
           mkdir -p "$RUNNER_TEMP/input"
+          # Kick/YouTube with start and/or end: download only that section
+          # (a 10 h VOD is 15-30 GB, more than the runner's disk). A stream
+          # copy, no re-encode; run_clip_job.py then does not cut it again.
+          section=$(python3 .github/scripts/run_clip_job.py --section-spec --start "$START" --end "$END") \
+            || { echo "$section"; exit 1; }   # bad start/end: show the ::error:: line
           host=$(python3 -c 'import sys, urllib.parse; print((urllib.parse.urlparse(sys.argv[1].strip()).hostname or "").lower())' "$VIDEO_URL")
           case "$host" in
             drive.google.com|docs.google.com) kind=drive ;;
@@ -118,8 +125,19 @@ jobs:
           if [ "$kind" = drive ]; then
             gdown --fuzzy "$VIDEO_URL" -O "$RUNNER_TEMP/input/" 2>&1 | tee "$log"
           else
+            sections=()
+            if [ -n "$section" ]; then
+              echo "Downloading only $section of the video"
+              sections=(--download-sections "$section")
+            fi
+            # Separate video+audio first: YouTube's combined files stop at
+            # 360p. H.264 preferred and AV1 never: the backend's ffmpeg and
+            # OpenCV cannot decode AV1. Kick's HLS formats are combined and
+            # land on b[height<=1080].
             yt-dlp --no-playlist --no-progress \
-              -f 'b[height<=1080]/bv*[height<=1080]+ba/b' --merge-output-format mp4 \
+              -f 'bv*[height<=1080][vcodec^=avc1]+ba/bv*[height<=1080][vcodec!^=av01]+ba/b[height<=1080]/b' \
+              --merge-output-format mp4 \
+              "${sections[@]}" \
               -o "$RUNNER_TEMP/input/source.%(ext)s" -- "$VIDEO_URL" 2>&1 | tee "$log"
           fi
           rc=${PIPESTATUS[0]}
@@ -145,6 +163,9 @@ jobs:
           mv "$src" "$RUNNER_TEMP/source.$ext"
           ls -lh "$RUNNER_TEMP/source.$ext"
           echo "SOURCE=$RUNNER_TEMP/source.$ext" >> "$GITHUB_ENV"
+          if [ "$kind" = ytdlp ] && [ -n "$section" ]; then
+            echo "SOURCE_IS_SECTION=1" >> "$GITHUB_ENV"
+          fi
 
       - name: Get the transcript from the earlier run
         if: ${{ inputs.transcript_from_run != '' }}
@@ -200,17 +221,20 @@ jobs:
           CREATOR_NAME: ${{ inputs.creator_name }}
           FACECAM_BOX: ${{ inputs.facecam_box }}
         run: |
-          reuse=()
+          extra=()
           if [ -n "$REUSE_RUN" ]; then
-            reuse=(--transcript "$RUNNER_TEMP/prev-transcript/transcript.json"
+            extra=(--transcript "$RUNNER_TEMP/prev-transcript/transcript.json"
                    --transcript-manifest "$RUNNER_TEMP/prev-transcript/manifest.json")
+          fi
+          if [ "${SOURCE_IS_SECTION:-}" = 1 ]; then
+            extra+=(--source-is-section)
           fi
           python3 .github/scripts/run_clip_job.py \
             --source "$SOURCE" --out "$GITHUB_WORKSPACE/clips" --workdir "$RUNNER_TEMP" \
             --video-url "$VIDEO_URL" --state-dir "$RUNNER_TEMP/clip-state" \
             --layout "$LAYOUT" --clips "$CLIP_COUNT" --start "$START" --end "$END" \
             --creator-name "$CREATOR_NAME" --facecam-box "$FACECAM_BOX" \
-            --finish-by "$FINISH_BY" "${reuse[@]}"
+            --finish-by "$FINISH_BY" "${extra[@]}"
 
       # Runs on failure too: transcription is the slow part, and a later run
       # (transcript_from_run = this run's ID) can start from it.
