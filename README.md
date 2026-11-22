@@ -37,6 +37,8 @@ Optional `.env` settings:
 | `GEMINI_MODEL` | Model for everything else (default `gemini-3.1-flash-lite`) |
 | `CONTENT_FILTER` | `0` turns the content filter off (on by default) |
 | `CONTENT_FILTER_EXTRA` | Your own comma-separated words, treated like slurs |
+| `SCREEN_CHECK` | `0` keeps clips that show a desktop or stream dashboard (stream layouts only; `1` checks every job) |
+| `DARK_LIFT` | `0` turns off the brightness lift for dark clips |
 
 When a model is busy (503 "high demand", 429, 500 or a timeout), it gets one
 retry, then the next model in the list takes over. If every model is busy, the
@@ -75,6 +77,8 @@ video and uploads the clips as an artifact you can download for 7 days.
 | `layout` | `streamer` | `streamer`, `general` or `auto` (see Layouts) |
 | `clip_count` | `8` | 1–15 |
 | `start` / `end` | | Optional, in seconds or `[HH:]MM:SS`. Use these to clip part of a long VOD. |
+| `creator_name` | | Optional. Titles and hooks lead with this name, e.g. "Dasgas Dom runs into TIGERS". |
+| `facecam_box` | | Optional, `streamer` layout only: the webcam's `x,y,w,h` in percent of the 16:9 frame, e.g. `0,0,20,35` for a top-left box 20% wide and 35% tall. Use it when the webcam isn't found. Every scene is then stacked with that box. |
 | `transcript_from_run` | | Optional run ID of an earlier run with the same link, start and end. That run's transcript is reused, so transcription is skipped. |
 
 3. Download the `clips-…` artifact. It contains the clips, `titles.md` (titles,
@@ -91,11 +95,21 @@ Google Drive link instead. If this repository is public, anyone signed in to
 GitHub can download its artifacts and read its logs. That includes the
 `transcript-…` artifact, which holds the full transcript of the video.
 
+## Stream VODs
+
+With the `streamer` or `general` layout:
+
+- Clips that mostly show a desktop, stream dashboard or chat instead of the
+  game are skipped. The picker replaces those moments with gameplay before it
+  picks, so you still get your clip count when the VOD has enough gameplay.
+- Dark clips (night scenes) get a mild brightness and contrast lift.
+- Titles and hooks never name a streaming platform the stream didn't mention.
+
 ## Layouts
 
 | Layout | Best for | What you get |
 |---|---|---|
-| **Stream: facecam over gameplay** (`streamer`) | Stream VODs with a webcam overlay | The webcam on the top half and a centre crop of the gameplay on the bottom, with captions on the seam. The gameplay crop steps sideways if it would cut through the webcam. Scenes without the webcam use the blurred layout. |
+| **Stream: facecam over gameplay** (`streamer`) | Stream VODs with a webcam overlay | The webcam on the top half and a centre crop of the gameplay on the bottom, with captions on the seam. A small webcam box in a corner is found and scaled up. The gameplay crop steps sideways if it would cut through the webcam. Scenes without the webcam use the blurred layout. |
 | **Stream: blurred gameplay** (`general`) | Gameplay with or without a facecam | The whole 16:9 frame over a blurred copy of itself |
 | **Auto** | Podcasts, talking heads, tutorials | The AI picks per video: follow the speaker, stack two speakers, or show a screen over the presenter |
 | Two speakers stacked | Two-person podcasts | One speaker per half |

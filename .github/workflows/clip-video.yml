@@ -40,6 +40,16 @@ on:
         required: false
         default: ""
         type: string
+      creator_name:
+        description: "Optional creator name for titles and hooks (e.g. Dasgas Dom)"
+        required: false
+        default: ""
+        type: string
+      facecam_box:
+        description: "Optional webcam box x,y,w,h in % of the frame (streamer layout), e.g. 0,0,20,35; use when the webcam is not found"
+        required: false
+        default: ""
+        type: string
       transcript_from_run:
         description: "Optional run ID of an earlier run of this video (same link, start and end): reuse its transcript and skip transcription"
         required: false
@@ -187,6 +197,8 @@ jobs:
           START: ${{ inputs.start }}
           END: ${{ inputs.end }}
           REUSE_RUN: ${{ inputs.transcript_from_run }}
+          CREATOR_NAME: ${{ inputs.creator_name }}
+          FACECAM_BOX: ${{ inputs.facecam_box }}
         run: |
           reuse=()
           if [ -n "$REUSE_RUN" ]; then
@@ -197,6 +209,7 @@ jobs:
             --source "$SOURCE" --out "$GITHUB_WORKSPACE/clips" --workdir "$RUNNER_TEMP" \
             --video-url "$VIDEO_URL" --state-dir "$RUNNER_TEMP/clip-state" \
             --layout "$LAYOUT" --clips "$CLIP_COUNT" --start "$START" --end "$END" \
+            --creator-name "$CREATOR_NAME" --facecam-box "$FACECAM_BOX" \
             --finish-by "$FINISH_BY" "${reuse[@]}"
 
       # Runs on failure too: transcription is the slow part, and a later run

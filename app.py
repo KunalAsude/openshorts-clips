@@ -6051,6 +6051,28 @@ def layout_env(requested):
     return env
 
 
+def stream_job_env(facecam_box, creator_name):
+    """FACECAM_BOX / CREATOR_NAME for a job, normalised; 400 on a bad value.
+    The box is re-printed from its numbers, never passed through as typed."""
+    import camera_inset  # no cv2 at import time: its detectors import it lazily
+    import creator
+    env = {}
+    try:
+        box = camera_inset.parse_facecam_box(facecam_box)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if box:
+        env["FACECAM_BOX"] = ",".join(f"{v:g}" for v in box)
+    name = (creator_name or "").strip()
+    if name:
+        if not creator.valid(name):
+            raise HTTPException(
+                status_code=400,
+                detail=f"creator_name: up to {creator.MAX_LEN} letters, digits, spaces and . ' -")
+        env["CREATOR_NAME"] = name
+    return env
+
+
 class EstimateRequest(BaseModel):
     url: Optional[str] = None
     seconds: Optional[float] = None  # a local file: the browser read its duration
@@ -6143,6 +6165,8 @@ async def process_endpoint(
     max_minutes: Optional[str] = Form(None),
     source_start: Optional[str] = Form(None),
     source_end: Optional[str] = Form(None),
+    facecam_box: Optional[str] = Form(None),
+    creator_name: Optional[str] = Form(None),
 ):
     if transcript is not None and file is None:
         # Only an uploaded file is guaranteed to be the video the transcript
@@ -6280,6 +6304,10 @@ async def process_endpoint(
     env.update(chosen)
     if chosen:
         print(f"[layouts] job={job_id} enabled={sorted(chosen)}")
+
+    # Stream jobs: where the webcam is (when detection misses it) and whose
+    # stream it is (titles/hooks). Checked here, read by camera_inset/creator.
+    env.update(stream_job_env(facecam_box, creator_name))
 
     # Auto-hook: burn each clip's Gemini hook text during the render. Off when
     # the field is absent, so API/MCP/webhook callers keep their old output

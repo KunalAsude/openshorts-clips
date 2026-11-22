@@ -134,7 +134,7 @@ def check_manifest(manifest_path, current):
                "transcript_from_run empty to transcribe again.")
 
 
-def submit(api, path, layout, clips, transcript=None):
+def submit(api, path, layout, clips, transcript=None, facecam_box="", creator_name=""):
     fields = {
         "output_format": "vertical",
         "clip_min_seconds": "20",
@@ -146,6 +146,10 @@ def submit(api, path, layout, clips, transcript=None):
     }
     if layout != "auto":
         fields["layouts"] = layout
+    if facecam_box:
+        fields["facecam_box"] = facecam_box
+    if creator_name:
+        fields["creator_name"] = creator_name
     cmd = ["curl", "-sS", "--fail-with-body", "--max-time", "3600",
            "-X", "POST", f"{api}/api/process",
            "-F", f"file=@{path};type=video/mp4"]
@@ -260,6 +264,9 @@ def main(argv=None):
     p.add_argument("--api", default="http://localhost:8000")
     p.add_argument("--layout", default="streamer")
     p.add_argument("--clips", default="8")
+    p.add_argument("--facecam-box", default="",
+                   help="x,y,w,h of the webcam in percent of the frame (streamer layout)")
+    p.add_argument("--creator-name", default="", help="name used in titles and hooks")
     p.add_argument("--start", default="")
     p.add_argument("--end", default="")
     p.add_argument("--video-url", default="",
@@ -289,6 +296,11 @@ def main(argv=None):
     if not 1 <= clips <= 15:
         fail("clip_count must be between 1 and 15.")
 
+    facecam_box = a.facecam_box.strip()
+    if facecam_box and layout != "streamer":
+        print("::warning::facecam_box only applies to the streamer layout; ignoring it.")
+        facecam_box = ""
+
     stop_at = a.finish_by or (time.time() + a.deadline_minutes * 60)
     path, offset = prepare(a.source, parse_time(a.start), parse_time(a.end), a.workdir)
     # Seconds, so "35:00" and "2100" count as the same start.
@@ -300,7 +312,8 @@ def main(argv=None):
                  "artifact (it may have failed before transcribing, or expired).")
         check_manifest(a.transcript_manifest, manifest)
         print("Reusing the earlier run's transcript: no transcription this time", flush=True)
-    job_id = submit(a.api.rstrip("/"), path, layout, clips, a.transcript or None)
+    job_id = submit(a.api.rstrip("/"), path, layout, clips, a.transcript or None,
+                    facecam_box=facecam_box, creator_name=a.creator_name.strip())
     if a.state_dir:
         os.makedirs(a.state_dir, exist_ok=True)
         with open(os.path.join(a.state_dir, "job.json"), "w", encoding="utf-8") as f:

@@ -27,6 +27,8 @@ from google.genai import types as genai_types
 import frame_sampler
 import gpu_decode
 import content_filter
+import creator
+import screen_check
 import gemini_worker
 import hook_grounding
 import layout_picker
@@ -39,7 +41,7 @@ from clip_selection import (build_transcript_windows, clip_count_targets,
                             score_batches, shortlist_target,
                             snap_clip_to_words, trim_to_best,
                             vision_segments)
-from ffmpeg_utils import (video_encode_args, audio_encode_args, cut_clip, QUALITY,
+from ffmpeg_utils import (video_encode_args, audio_encode_args, cut_clip, dark_lift_filter, QUALITY,
                           QUALITY_FAST, METADATA_SCRUB)
 from dotenv import load_dotenv
 import json
@@ -2570,7 +2572,7 @@ def score_batch_size():
     return 3 if llm_backend.active() else 8
 
 
-def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
+def get_viral_clips(transcript_result, video_duration, viewer_clips=None, video_path=None):
     """Two-pass clip selection: score transcript windows, then detail the best.
 
     Windowing gives even coverage on long videos (a single call over the whole
@@ -2581,6 +2583,10 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
     ``viewer_clips`` (``twitch_signals.viewer_clips_for_job``): stretches the
     stream's own viewers clipped. They are shown to both passes on the windows
     that hold them, and the hottest windows are guaranteed a shortlist slot.
+
+    ``video_path``: the source, for the stream-VOD screen check
+    (screen_check.keep_game_windows): shortlisted windows that show a desktop
+    instead of the game are swapped for the next best gameplay windows.
     """
     language = str(transcript_result.get('language') or 'unknown')
     if llm_backend.active():
@@ -2672,6 +2678,9 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             added = [w["id"] for w in shortlist if w["id"] not in before]
             if added:
                 print(f"   👀 Promoted {len(added)} window(s) viewers clipped: {added}")
+        if video_path and screen_check.enabled() and not llm_backend.active():
+            ranked = [by_id[w["id"]] for w in scored if w.get("id") in by_id] or windows
+            shortlist = screen_check.keep_game_windows(video_path, shortlist, ranked, target)
         print(f"   Shortlisted {len(shortlist)} window(s) for detail.")
 
         # --- Pass 2: detailed clip extraction on the shortlist ---
@@ -2693,7 +2702,7 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
                     min_clips=lo, max_clips=hi,
                     min_secs=min_secs, max_secs=max_secs,
                     windows_json=json.dumps(_payload(ws), ensure_ascii=False)
-                ) + content_filter.prompt_rule()
+                ) + content_filter.prompt_rule() + creator.prompt_rule()
             return build
 
         shorts = []
@@ -2886,7 +2895,7 @@ def _visual_pass(client, model_name, video_path, duration, language,
         prompt = gemini_worker.VISUAL_PROMPT_TEMPLATE.format(
             video_duration=duration, language=language,
             min_clips=min_clips, max_clips=max_clips,
-            min_secs=min_secs, max_secs=max_secs) + (hint or "") + content_filter.prompt_rule()
+            min_secs=min_secs, max_secs=max_secs) + (hint or "") + content_filter.prompt_rule() + creator.prompt_rule()
         config = genai_types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=gemini_worker.VisualResponse,
@@ -3349,7 +3358,8 @@ if __name__ == '__main__':
             print("♻️ Using the clips Gemini picked while the video downloaded.")
             clips_data = early_clips
         elif transcript is not None:
-            clips_data = get_viral_clips(transcript, duration, viewer_clips=viewer_clips)
+            clips_data = get_viral_clips(transcript, duration, viewer_clips=viewer_clips,
+                                         video_path=input_video)
         else:
             clips_data = get_visual_clips(input_video, duration, viewer_clips=viewer_clips)
 
@@ -3362,6 +3372,16 @@ if __name__ == '__main__':
                 raise RuntimeError(
                     f"All {picked} clips the AI picked contain a slur, so none were made "
                     "(CONTENT_FILTER=0 turns the content filter off).")
+
+        # Stream VODs: skip clips that show the streamer's desktop or stream
+        # dashboard instead of the game (screen_check; SCREEN_CHECK=0 = off).
+        if clips_data and clips_data.get('shorts') and screen_check.enabled():
+            picked = len(clips_data['shorts'])
+            clips_data['shorts'] = screen_check.drop_desktop_clips(clips_data['shorts'], input_video)
+            if not clips_data['shorts']:
+                raise RuntimeError(
+                    f"All {picked} clips the AI picked show a desktop or stream dashboard "
+                    "instead of the game, so none were made (SCREEN_CHECK=0 turns this check off).")
 
         if not clips_data or 'shorts' not in clips_data:
             # Deliberately fail instead of reframing the whole video: that path
@@ -3407,7 +3427,12 @@ if __name__ == '__main__':
 
                 try:
                     # ffmpeg cut — re-encoding for precision on strict seconds
-                    cut_clip(input_video, clip_temp_path, start, end, i + 1)
+                    # Night gameplay: a mild lift inside the cut's own encode.
+                    lift = dark_lift_filter(input_video, start, end)
+                    if lift:
+                        print(f"   🌙 Clip {i+1} is dark: lifting brightness")
+                        clip['brightness_lift'] = True
+                    cut_clip(input_video, clip_temp_path, start, end, i + 1, lift=lift)
                     import scene_detection
                     scene_detection.register_clip(clip_temp_path, start)
 

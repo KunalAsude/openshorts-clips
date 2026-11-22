@@ -470,7 +470,41 @@ def cut_rate_filter(input_video):
     return ["-vf", f"fps={target.numerator}/{target.denominator}"]
 
 
-def cut_clip(input_video, clip_temp_path, start, end, clip_number):
+# Night gameplay comes out murky on a phone. A clip whose sampled frames
+# average under DARK_LUMA (grey level 0-255) gets LIFT_FILTER inside the cut's
+# own encode (no extra pass). Measured on a GTA stream VOD: night scenes
+# 18-49, a lit shop and the streamer's room 66-71. DARK_LIFT=0 turns it off.
+DARK_LUMA = float(os.environ.get("DARK_LUMA", "55"))
+LIFT_FILTER = "eq=gamma=1.25:contrast=1.08:brightness=0.03:saturation=1.08"
+
+
+def dark_lift_filter(input_video, start, end, samples=6):
+    """LIFT_FILTER when [start, end] of the source is dark, else None."""
+    if os.environ.get("DARK_LIFT", "1").strip() == "0":
+        return None
+    try:
+        import cv2
+        cap = cv2.VideoCapture(input_video)
+        means = []
+        try:
+            span = max(0.0, float(end) - float(start))
+            for i in range(samples):
+                cap.set(cv2.CAP_PROP_POS_MSEC, (float(start) + span * (i + 0.5) / samples) * 1000.0)
+                ok, frame = cap.read()
+                if ok:
+                    means.append(float(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).mean()))
+        finally:
+            cap.release()
+    except Exception as e:
+        print(f"   ⚠️ Brightness check failed ({type(e).__name__}: {e})")
+        return None
+    if not means:
+        return None
+    means.sort()
+    return LIFT_FILTER if means[len(means) // 2] < DARK_LUMA else None
+
+
+def cut_clip(input_video, clip_temp_path, start, end, clip_number, lift=None):
     """Cut [start, end] out of the source into ``clip_temp_path``.
 
     Raises RuntimeError with ffmpeg's own stderr when the cut does not produce
@@ -490,6 +524,9 @@ def cut_clip(input_video, clip_temp_path, start, end, clip_number):
     """
     encode_args = video_encode_args(INTERMEDIATE)
     rate = cut_rate_filter(input_video)
+    if lift:
+        # ``lift`` (dark_lift_filter) joins the rate cap in one -vf chain.
+        rate = ["-vf", ",".join([*rate[1:], lift])]
     command = [
         'ffmpeg', '-y',
         '-ss', str(start),
@@ -501,7 +538,7 @@ def cut_clip(input_video, clip_temp_path, start, end, clip_number):
         clip_temp_path
     ]
     gpu_command = None
-    if _gpu_cut_ok(input_video):
+    if not lift and _gpu_cut_ok(input_video):  # eq runs on CPU frames
         # CUDA frames are already 4:2:0 (nv12); -pix_fmt would force a copy
         # back to system memory.
         gpu_args = list(encode_args)

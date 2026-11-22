@@ -348,6 +348,20 @@ def _centre_inside(det, box, slack):
     return (x - slack <= cx <= x + w + slack) and (y - slack <= cy <= y + h + slack)
 
 
+def _person_in_region(m, frame, box, slack):
+    """Person boxes (frame coordinates) found in ``box`` grown by ``slack``."""
+    fh, fw = frame.shape[:2]
+    x0, y0 = max(0, int(box[0] - slack)), max(0, int(box[1] - slack))
+    x1 = min(fw, int(box[0] + box[2] + slack))
+    y1 = min(fh, int(box[1] + box[3] + slack))
+    if x1 - x0 < 16 or y1 - y0 < 16:
+        return []
+    person = m.detect_person_yolo(frame[y0:y1, x0:x1].copy())
+    if not person:
+        return []
+    return [(person[0] + x0, person[1] + y0, person[2], person[3])]
+
+
 def present_in_scene(video_path, box, start_f, end_f, samples=3):
     """Whether the webcam really sits in ``box`` during this scene.
 
@@ -382,6 +396,10 @@ def present_in_scene(video_path, box, start_f, end_f, samples=3):
             if not any(_centre_inside(d, box, slack) for d in dets):
                 person = m.detect_person_yolo(frame)
                 dets = [person] if person else []
+            if not any(_centre_inside(d, box, slack) for d in dets):
+                # A small corner inset: on the whole frame the detector picks
+                # the game character, so look inside the box itself.
+                dets = _person_in_region(m, frame, box, slack)
             if any(_centre_inside(d, box, slack) for d in dets):
                 hits += 1
     finally:
@@ -408,12 +426,264 @@ if STREAM_MODE not in STREAM_MODES:
 STREAMER_CAMERA_RATIO = 0.50
 
 
-def _band_crop(box, orig_w, orig_h, target_aspect):
+# --------------------------------------------------------------------------- #
+# Small corner webcam on gameplay.
+#
+# ``detect`` looks at the whole frame, and on gameplay the whole frame is the
+# wrong place to look: the game character is the biggest person in it, so the
+# person detector returns them, and the streamer's face in a 20%-wide inset is
+# too few pixels for the face detector (measured on a GTA stream VOD: 8 of 8
+# samples gave the game character, 0 the webcam). Searched one corner at a time
+# the same detector finds the streamer in the same spot in every sample, while
+# hits in the other corners wander with the game.
+#
+# The inset's real rectangle then comes from its border: a straight edge that
+# stays in one place while the gameplay next to it changes. A box grown from
+# the person would be a guess (16:9 around a face); the border is exact, so the
+# crop can stay inside it instead of spilling gameplay into the camera band.
+# --------------------------------------------------------------------------- #
+
+CORNER_REGION_W = 0.40   # share of the frame searched at each corner
+CORNER_REGION_H = 0.55
+# A corner inset is at most this big; past it ``detect`` is the right tool.
+MAX_CORNER_INSET_W = 0.50
+MAX_CORNER_INSET_H = 0.60
+MIN_CORNER_INSET_H = 0.12
+# A border line is a peak this many times the profile's median, and at least
+# this share of the strongest peak (the outermost such peak wins: lines inside
+# the inset, a shelf or a door frame, are shorter and sit nearer the person).
+BORDER_PEAK_X_MEDIAN = 4.0
+BORDER_PEAK_SHARE = 0.6
+
+_CORNERS = ("top-left", "top-right", "bottom-left", "bottom-right")
+
+
+def _corner_view(frame, corner):
+    """The frame flipped so ``corner`` is top-left (a view, no copy)."""
+    if corner.endswith("right"):
+        frame = frame[:, ::-1]
+    if corner.startswith("bottom"):
+        frame = frame[::-1]
+    return frame
+
+
+def _unflip(box, corner, frame_w, frame_h):
+    x, y, w, h = box
+    if corner.endswith("right"):
+        x = frame_w - x - w
+    if corner.startswith("bottom"):
+        y = frame_h - y - h
+    return (int(x), int(y), int(w), int(h))
+
+
+def _outer_peak(profile, lo, hi):
+    """Index of the outermost strong peak of ``profile`` in [lo, hi), or None."""
+    import numpy as np
+
+    hi = min(hi, len(profile))
+    if hi - lo < 3:
+        return None
+    seg = profile[lo:hi]
+    top = float(seg.max())
+    floor = float(np.median(profile)) or 1e-6
+    if top < BORDER_PEAK_X_MEDIAN * floor:
+        return None
+    strong = np.nonzero(seg >= BORDER_PEAK_SHARE * top)[0]
+    if not len(strong):
+        return None
+    i = int(strong[-1])
+    # A border is often two pixels wide: take the stronger of the pair.
+    if i > 0 and seg[i - 1] > seg[i]:
+        i -= 1
+    return lo + i
+
+
+def find_border(grays, seed):
+    """(w, h) of an inset anchored at the top-left of these (already flipped)
+    grey frames, from its persistent right and bottom edges, or None.
+
+    ``seed`` is the person's box in the same coordinates: the border lies
+    beyond it. Two passes: a first guess from the rows/columns that are surely
+    inside the inset (the person's own band), then the same search over the
+    inset's whole height/width, where the real border is the only line that
+    runs the full length."""
+    import numpy as np
+
+    fh, fw = grays[0].shape
+    sx, sy, sw, sh = seed
+    max_w, max_h = int(fw * MAX_CORNER_INSET_W), int(fh * MAX_CORNER_INSET_H)
+
+    def cols(r0, r1):
+        return np.median([np.abs(np.diff(g[r0:r1, :max_w + 2], axis=1)).mean(axis=0)
+                          for g in grays], axis=0)
+
+    def rows(c0, c1):
+        return np.median([np.abs(np.diff(g[:max_h + 2, c0:c1], axis=0)).mean(axis=1)
+                          for g in grays], axis=0)
+
+    x_edge = _outer_peak(cols(sy, sy + sh), sx + sw, max_w)
+    y_edge = _outer_peak(rows(sx, sx + sw), sy + sh, max_h)
+    if x_edge is None or y_edge is None:
+        return None
+    # Second pass over the full extent, a few pixels either side of the guess.
+    full_c, full_r = cols(0, y_edge), rows(0, x_edge)
+    x2 = _outer_peak(full_c, max(sx + sw, x_edge - 12), x_edge + 13)
+    y2 = _outer_peak(full_r, max(sy + sh, y_edge - 12), y_edge + 13)
+    w, h = (x2 if x2 is not None else x_edge) + 1, (y2 if y2 is not None else y_edge) + 1
+    if not (MIN_CORNER_INSET_H * fh <= h <= max_h and w <= max_w and 0.6 <= w / h <= 2.4):
+        return None
+    return w, h
+
+
+def corner_detect(video_path, samples=10):
+    """A small webcam inset in a corner of gameplay: (x, y, w, h) or None.
+
+    Finds the corner where a person sits still in most samples, then measures
+    the inset from its border (``find_border``); when there is no clear
+    border, a 16:9 box grown from the person (``inset_box``), as ``detect``
+    would. Exact boxes are good for ``streamer_filtergraph(fit="inside")``.
+    """
+    import cv2
+    import numpy as np
+    import main as m
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if total <= 0 or not frame_w:
+        cap.release()
+        return None
+    rw, rh = int(frame_w * CORNER_REGION_W), int(frame_h * CORNER_REGION_H)
+    hits = {c: [] for c in _CORNERS}
+    grays = []
+    try:
+        for i in range(samples):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int((i + 0.5) * total / samples))
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            grays.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32))
+            for corner in _CORNERS:
+                region = np.ascontiguousarray(_corner_view(frame, corner)[:rh, :rw])
+                box = m.detect_person_yolo(region)
+                if box and box[3] <= rh * 0.95:
+                    hits[corner].append(tuple(box))
+    finally:
+        cap.release()
+
+    need = max(3, int(np.ceil(len(grays) * 0.6)))
+    best = None
+    for corner, boxes in hits.items():
+        if len(boxes) < need:
+            continue
+        arr = np.array(boxes, dtype=float)
+        cx, cy = arr[:, 0] + arr[:, 2] / 2, arr[:, 1] + arr[:, 3] / 2
+        tol = frame_w * MAX_CENTRE_SPREAD
+        close = (np.abs(cx - np.median(cx)) <= tol) & (np.abs(cy - np.median(cy)) <= tol)
+        if close.sum() < need:
+            continue
+        if best is None or close.sum() > best[1]:
+            best = (corner, int(close.sum()), tuple(int(v) for v in np.median(arr[close], axis=0)))
+    if best is None:
+        return None
+    corner, _n, seed = best
+
+    flipped = [np.ascontiguousarray(_corner_view(g, corner)) for g in grays]
+    size = find_border(flipped, seed)
+    if size:
+        box = _unflip((0, 0, size[0], size[1]), corner, frame_w, frame_h)
+        print(f"   🎮 Corner webcam ({corner}) measured from its border: {box}")
+        return box
+    box = inset_box(_unflip(seed, corner, frame_w, frame_h), frame_w, frame_h)
+    if not usable(box, frame_h, min_ratio=0.08, max_ratio=MAX_CORNER_INSET_H):
+        return None
+    print(f"   🎮 Corner webcam ({corner}), no clear border, estimated: {box}")
+    return box
+
+
+def parse_facecam_box(text):
+    """``"x,y,w,h"`` in percent of the frame -> four floats, or None when the
+    text is empty. Raises ValueError for anything else (API input)."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    parts = [p.strip().rstrip("%") for p in text.split(",")]
+    if len(parts) != 4:
+        raise ValueError("facecam_box needs four numbers: x,y,w,h (percent)")
+    try:
+        x, y, w, h = (float(p) for p in parts)
+    except ValueError:
+        raise ValueError("facecam_box values must be numbers (percent)")
+    if not all(0 <= v <= 100 for v in (x, y, w, h)) or w < 2 or h < 2:
+        raise ValueError("facecam_box values must be 0-100, width and height at least 2")
+    if x + w > 100.01 or y + h > 100.01:
+        raise ValueError("facecam_box must fit inside the frame (x+w and y+h at most 100)")
+    return x, y, w, h
+
+
+def forced_box(frame_w, frame_h, env=None):
+    """FACECAM_BOX (x,y,w,h in percent) as a pixel box, or None when unset or
+    malformed (the API validated it already; a bad value here is ignored)."""
+    raw = (os.environ if env is None else env).get("FACECAM_BOX", "")
+    try:
+        pct = parse_facecam_box(raw)
+    except ValueError:
+        print(f"   ⚠️ Ignoring FACECAM_BOX={raw!r}: expected x,y,w,h in percent")
+        return None
+    if not pct:
+        return None
+    x, y, w, h = (int(round(v / 100.0 * d)) for v, d in
+                  zip(pct, (frame_w, frame_h, frame_w, frame_h)))
+    w, h = min(w, frame_w - x), min(h, frame_h - y)
+    return (x - x % 2, y - y % 2, max(2, w - w % 2), max(2, h - h % 2))
+
+
+def find_webcam(video_path, frame_w, frame_h):
+    """``(box, fit, forced)`` of the stream's webcam for the STREAMER layout.
+
+    FACECAM_BOX wins (forced: every scene uses it). Then ``detect`` (a large
+    or clearly visible camera; its box is an estimate, so the band crop may
+    grow past it) and, when that finds nothing, ``corner_detect`` (a small
+    inset on gameplay; its box is measured, so the crop stays inside it).
+    ``box`` is None when there is no webcam to stack."""
+    box = forced_box(frame_w, frame_h)
+    if box:
+        return box, "inside", True
+    box = detect(video_path)
+    if box:
+        return box, "grow", False
+    box = corner_detect(video_path)
+    return box, "inside", False
+
+
+def _band_crop(box, orig_w, orig_h, target_aspect, inside=False):
     """``box`` widened (or heightened) to ``target_aspect`` around its centre,
     clamped to the frame and rounded to even numbers, so scaling it into a band
-    of that aspect is uniform and never stretches a face."""
+    of that aspect is uniform and never stretches a face.
+
+    ``inside``: trim the box to the aspect instead of growing it, for a box
+    that is the camera's exact rectangle (growing it would show the gameplay
+    around the inset in the camera band). Trimmed from the bottom when
+    shortened, where a webcam frames shoulders rather than the face."""
     x, y, w, h = box
     w, h = max(2, w), max(2, h)
+    if inside:
+        if w / float(h) < target_aspect:
+            h = max(2, int(round(w / target_aspect)))
+        else:
+            new_w = max(2, int(round(h * target_aspect)))
+            x = int(round(x + (w - new_w) / 2.0))
+            w = new_w
+        x = max(0, min(x, orig_w - w))
+        y = max(0, min(y, orig_h - h))
+        w -= w % 2
+        h -= h % 2
+        x += x % 2
+        y += y % 2
+        return x, y, w, h
     if w / float(h) < target_aspect:
         want_w = min(orig_w, int(round(h * target_aspect)))
         x = int(round(x + w / 2.0 - want_w / 2.0))
@@ -463,18 +733,22 @@ def gameplay_crop(orig_w, orig_h, band_aspect, box):
 
 
 def streamer_filtergraph(orig_w, orig_h, out_w, out_h, box,
-                         camera_ratio=STREAMER_CAMERA_RATIO):
+                         camera_ratio=STREAMER_CAMERA_RATIO, fit="grow"):
     """Webcam on top, gameplay below, stacked with no filler.
 
     The opposite order from inset_filtergraph on purpose: there the screen is
     the subject and is kept whole; here the gameplay is cropped to fill its band
     and the streamer's face leads the frame, the way stream clips are cut.
+
+    ``fit="inside"`` for a measured box (``find_webcam``): the camera crop is
+    trimmed to the band instead of growing past the inset's edges.
     """
     cam_h = int(out_h * camera_ratio)
     cam_h -= cam_h % 2
     game_h = out_h - cam_h
 
-    cx, cy, cw, ch = _band_crop(box, orig_w, orig_h, out_w / float(cam_h))
+    cx, cy, cw, ch = _band_crop(box, orig_w, orig_h, out_w / float(cam_h),
+                                inside=(fit == "inside"))
     gx, gy, gw, gh = gameplay_crop(orig_w, orig_h, out_w / float(game_h), box)
 
     return (

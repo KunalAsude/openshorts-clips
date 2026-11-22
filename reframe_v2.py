@@ -819,20 +819,24 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     # STREAMER: the webcam box is fixed for the whole recording, so it is found
     # once, then confirmed per scene (a stream cuts to full-screen gameplay and
     # "be right back" cards); a scene without the webcam stays GENERAL.
+    # A small corner inset on gameplay is found by camera_inset.corner_detect
+    # and FACECAM_BOX forces the box (then every scene stacks, no presence
+    # check: the user said where the camera is).
     streamers = {}
+    cam_fit = "grow"
     if stream_mode == 'streamer':
-        cam = None
+        cam, forced = None, False
         try:
-            cam = camera_inset.detect(input_video)
+            cam, cam_fit, forced = camera_inset.find_webcam(input_video, orig_w, orig_h)
         except Exception as e:
             print(f"   ⚠️ Webcam check failed ({e}) — using the blurred layout.")
         if cam:
             for scene_idx, (start_f, end_f) in enumerate(scene_boundaries):
-                if camera_inset.present_in_scene(input_video, cam, start_f, end_f):
+                if forced or camera_inset.present_in_scene(input_video, cam, start_f, end_f):
                     strategies[scene_idx] = 'STREAMER'
                     streamers[start_f] = cam
-            print(f"   🎮 Webcam at {cam}: STREAMER layout on "
-                  f"{len(streamers)} of {len(scenes)} scene(s)")
+            print(f"   🎮 Webcam at {cam}{' (FACECAM_BOX)' if forced else ''}: "
+                  f"STREAMER layout on {len(streamers)} of {len(scenes)} scene(s)")
         else:
             print("   🎮 No steady webcam found — every scene on the blurred layout")
 
@@ -904,7 +908,7 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
 
             if strategy == 'STREAMER':
                 graph = camera_inset.streamer_filtergraph(
-                    orig_w, orig_h, out_w, out_h, streamers[start_f])
+                    orig_w, orig_h, out_w, out_h, streamers[start_f], fit=cam_fit)
             elif strategy == 'INSET':
                 graph = camera_inset.inset_filtergraph(
                     orig_w, orig_h, out_w, out_h, insets.get(start_f, inset))
